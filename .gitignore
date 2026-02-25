@@ -1,0 +1,29 @@
+# Data & outputs (large files)
+data/*/images/
+data/*/sparse/
+data/*/database.db
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+*.log
