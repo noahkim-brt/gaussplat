@@ -25,13 +25,16 @@ def load_ply_as_pointcloud(ply_path: str) -> o3d.geometry.PointCloud:
     pcd.points = o3d.utility.Vector3dVector(xyz)
 
     # Use SH DC term for color if available
-    if "f_rest_0" in vertex.data.dtype.names:
-        # SH DC coefficients (first 3 = RGB base color)
-        r = vertex["f_rest_0"] if "f_rest_0" in vertex.data.dtype.names else np.ones(len(xyz)) * 0.5
-        g = vertex["f_rest_1"] if "f_rest_1" in vertex.data.dtype.names else np.ones(len(xyz)) * 0.5
-        b = vertex["f_rest_2"] if "f_rest_2" in vertex.data.dtype.names else np.ones(len(xyz)) * 0.5
-        colors = np.column_stack([r, g, b])
-        colors = np.clip(colors, 0.0, 1.0)
+    names = vertex.data.dtype.names
+    if "f_dc_0" in names:
+        C0 = 0.28209479177387814
+        r = vertex["f_dc_0"] * C0 + 0.5
+        g = vertex["f_dc_1"] * C0 + 0.5
+        b = vertex["f_dc_2"] * C0 + 0.5
+        colors = np.clip(np.column_stack([r, g, b]), 0.0, 1.0)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+    elif "red" in names:
+        colors = np.column_stack([vertex["red"], vertex["green"], vertex["blue"]]) / 255.0
         pcd.colors = o3d.utility.Vector3dVector(colors)
 
     return pcd

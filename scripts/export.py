@@ -3,76 +3,66 @@
 import argparse
 from pathlib import Path
 
-import numpy as np
-from plyfile import PlyData, PlyElement
+import torch
+
+from gaussian_model import save_ply
 
 
-def export_ply(gaussians: dict, output_path: str) -> None:
-    """Export Gaussian parameters to a .ply file.
+def load_checkpoint(ckpt_dir: str) -> dict:
+    """Load Gaussian parameters from a checkpoint directory containing point_cloud.ply.
 
-    Args:
-        gaussians: Dict with keys 'xyz', 'opacity', 'scales', 'rotations', 'sh'.
-        output_path: Path to write the .ply file.
+    Re-imports the PLY into the same param dict format used by training so it
+    can be re-exported (e.g. after pruning or format conversion).
     """
-    xyz = gaussians["xyz"]  # (N, 3)
-    normals = np.zeros_like(xyz)  # placeholder normals
-    opacities = gaussians["opacity"]  # (N, 1)
-    scales = gaussians["scales"]  # (N, 3)
-    rotations = gaussians["rotations"]  # (N, 4)
-    sh = gaussians["sh"]  # (N, C) spherical harmonics coefficients
+    import numpy as np
+    from plyfile import PlyData
 
-    n = xyz.shape[0]
+    ply_path = Path(ckpt_dir) / "point_cloud.ply"
+    if not ply_path.exists():
+        ply_path = Path(ckpt_dir)
+        if not ply_path.exists():
+            raise FileNotFoundError(f"No PLY found at {ckpt_dir}")
 
-    attrs = [
-        ("x", "f4"),
-        ("y", "f4"),
-        ("z", "f4"),
-        ("nx", "f4"),
-        ("ny", "f4"),
-        ("nz", "f4"),
-        ("opacity", "f4"),
-    ]
+    ply = PlyData.read(str(ply_path))
+    v = ply["vertex"]
+    n = len(v["x"])
 
-    for i in range(scales.shape[1]):
-        attrs.append((f"scale_{i}", "f4"))
+    means = torch.tensor(np.column_stack([v["x"], v["y"], v["z"]]), dtype=torch.float32)
+    scales = torch.tensor(np.column_stack([v["scale_0"], v["scale_1"], v["scale_2"]]), dtype=torch.float32)
+    quats = torch.tensor(np.column_stack([v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]]), dtype=torch.float32)
+    opacities = torch.tensor(np.array(v["opacity"]), dtype=torch.float32)
 
-    for i in range(rotations.shape[1]):
-        attrs.append((f"rot_{i}", "f4"))
+    sh0 = torch.tensor(
+        np.column_stack([v["f_dc_0"], v["f_dc_1"], v["f_dc_2"]]),
+        dtype=torch.float32,
+    ).unsqueeze(1)
 
-    for i in range(sh.shape[1]):
-        attrs.append((f"f_rest_{i}", "f4"))
+    rest_cols = sorted([name for name in v.data.dtype.names if name.startswith("f_rest_")],
+                       key=lambda s: int(s.split("_")[-1]))
+    if rest_cols:
+        sh_rest = torch.tensor(
+            np.column_stack([np.array(v[c]) for c in rest_cols]),
+            dtype=torch.float32,
+        ).reshape(n, -1, 3)
+    else:
+        sh_rest = torch.zeros(n, 15, 3, dtype=torch.float32)
 
-    dtype = np.dtype(attrs)
-    elements = np.empty(n, dtype=dtype)
-
-    elements["x"] = xyz[:, 0]
-    elements["y"] = xyz[:, 1]
-    elements["z"] = xyz[:, 2]
-    elements["nx"] = normals[:, 0]
-    elements["ny"] = normals[:, 1]
-    elements["nz"] = normals[:, 2]
-    elements["opacity"] = opacities[:, 0]
-
-    for i in range(scales.shape[1]):
-        elements[f"scale_{i}"] = scales[:, i]
-
-    for i in range(rotations.shape[1]):
-        elements[f"rot_{i}"] = rotations[:, i]
-
-    for i in range(sh.shape[1]):
-        elements[f"f_rest_{i}"] = sh[:, i]
-
-    ply_element = PlyElement.describe(elements, "vertex")
-    PlyData([ply_element]).write(output_path)
-    print(f"Exported {n} Gaussians to {output_path}")
+    return {
+        "means": torch.nn.Parameter(means),
+        "scales": torch.nn.Parameter(scales),
+        "quats": torch.nn.Parameter(quats),
+        "opacities": torch.nn.Parameter(opacities),
+        "sh0": torch.nn.Parameter(sh0),
+        "sh_rest": torch.nn.Parameter(sh_rest),
+    }
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Export Gaussians to PLY")
-    parser.add_argument("--input", required=True, help="Path to trained model dir")
+    parser = argparse.ArgumentParser(description="Export / re-export Gaussians to PLY")
+    parser.add_argument("--input", required=True, help="Checkpoint dir or PLY path")
     parser.add_argument("--output", required=True, help="Output PLY path")
     args = parser.parse_args()
 
-    print("TODO: Load trained model and call export_ply()")
-    print(f"  Input: {args.input}")
-    print(f"  Output: {args.output}")
+    params = load_checkpoint(args.input)
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    save_ply(params, args.output)

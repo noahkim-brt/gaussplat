@@ -41,8 +41,9 @@ def run_sfm(
         database_path=str(database_path),
         image_path=str(images_path),
         camera_model=camera_model,
-        sift_options=pycolmap.SiftExtractionOptions(
+        extraction_options=pycolmap.FeatureExtractionOptions(
             max_image_size=max_image_size,
+            use_gpu=True,
         ),
     )
 

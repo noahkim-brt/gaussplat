@@ -1,4 +1,5 @@
 # Data & outputs (large files)
+data/*.mp4
 data/*/images/
 data/*/sparse/
 data/*/database.db
