@@ -3,7 +3,7 @@
 import argparse
 from pathlib import Path
 
-from extract_frames import extract_frames
+from extract_frames import extract_frames, extract_multicam
 from run_sfm import run_sfm
 from train import train
 
@@ -40,19 +40,22 @@ def run_pipeline(
         sh_degree: Max spherical harmonics degree.
         test_interval: Evaluation interval (0 to disable).
     """
-    video = Path(video_path)
-    if not video.exists():
-        raise FileNotFoundError(f"Video not found: {video}")
+    input_path = Path(video_path)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input not found: {input_path}")
+
+    multicam = input_path.is_dir()
 
     if not scene_name:
-        scene_name = video.stem
+        scene_name = input_path.stem if not multicam else input_path.name
 
     scene_dir = Path(data_root) / scene_name
     output_dir = Path(output_root) / scene_name
     images_dir = scene_dir / "images"
 
+    mode = "multi-camera" if multicam else "single video"
     print(f"{'='*60}")
-    print(f"Pipeline: {video.name} → {scene_name}")
+    print(f"Pipeline ({mode}): {input_path.name} → {scene_name}")
     print(f"  Scene dir:  {scene_dir}")
     print(f"  Output dir: {output_dir}")
     print(f"{'='*60}")
@@ -61,11 +64,13 @@ def run_pipeline(
     print(f"\n{'─'*60}")
     print("STEP 1: Frame extraction")
     print(f"{'─'*60}")
-    if images_dir.exists() and any(images_dir.glob("frame_*.jpg")):
-        num_existing = len(list(images_dir.glob("frame_*.jpg")))
+    if images_dir.exists() and any(images_dir.glob("*.jpg")):
+        num_existing = len(list(images_dir.glob("*.jpg")))
         print(f"Skipping: {num_existing} frames already exist in {images_dir}")
+    elif multicam:
+        extract_multicam(str(input_path), str(scene_dir), fps=fps, quality=quality)
     else:
-        extract_frames(str(video), str(images_dir), fps=fps, quality=quality)
+        extract_frames(str(input_path), str(images_dir), fps=fps, quality=quality)
 
     # Step 2: SfM
     print(f"\n{'─'*60}")
@@ -78,9 +83,10 @@ def run_pipeline(
     else:
         run_sfm(
             str(scene_dir),
-            matcher=matcher,
+            matcher="exhaustive" if multicam else matcher,
             max_num_features=max_features,
             max_image_size=max_image_size,
+            single_camera=not multicam,
         )
 
     # Step 3: Train
@@ -109,7 +115,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="End-to-end: video → frames → SfM → Gaussian splatting"
     )
-    parser.add_argument("--video", required=True, help="Path to input video")
+    parser.add_argument("--video", required=True, help="Video file or directory of videos (auto-detects multi-cam)")
     parser.add_argument("--scene-name", default="", help="Scene name (default: video stem)")
     parser.add_argument("--data-root", default="data", help="Data root directory")
     parser.add_argument("--output-root", default="output", help="Output root directory")
