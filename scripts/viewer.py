@@ -155,22 +155,74 @@ gl.enable(gl.PROGRAM_POINT_SIZE);
 gl.disable(gl.DEPTH_TEST);
 
 let numPoints = 0;
+let rawData = null;
+let sortedData = null;
+let vbo = null;
+let vao = null;
+let sortWorker = null;
+let sorting = false;
+let lastSortCamPos = [Infinity, Infinity, Infinity];
+
+const SORT_WORKER_SRC = `
+self.onmessage = function(e) {
+    const { positions, data, camX, camY, camZ, stride } = e.data;
+    const n = positions.length / 3;
+    const depths = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        const dx = positions[i*3] - camX;
+        const dy = positions[i*3+1] - camY;
+        const dz = positions[i*3+2] - camZ;
+        depths[i] = dx*dx + dy*dy + dz*dz;
+    }
+    const indices = new Uint32Array(n);
+    for (let i = 0; i < n; i++) indices[i] = i;
+    indices.sort((a, b) => depths[b] - depths[a]);
+    const sorted = new Float32Array(n * stride);
+    for (let i = 0; i < n; i++) {
+        const src = indices[i] * stride;
+        const dst = i * stride;
+        for (let j = 0; j < stride; j++) sorted[dst+j] = data[src+j];
+    }
+    self.postMessage({ sorted }, [sorted.buffer]);
+};`;
+
+function createSortWorker() {
+    const blob = new Blob([SORT_WORKER_SRC], { type: 'application/javascript' });
+    return new Worker(URL.createObjectURL(blob));
+}
+
+function requestSort() {
+    if (sorting || !rawData || numPoints === 0) return;
+    const dx = camPos[0]-lastSortCamPos[0], dy = camPos[1]-lastSortCamPos[1], dz = camPos[2]-lastSortCamPos[2];
+    if (dx*dx+dy*dy+dz*dz < 0.01 * camDist * camDist * 0.0001) return;
+    sorting = true;
+    const positions = new Float32Array(numPoints * 3);
+    for (let i = 0; i < numPoints; i++) {
+        positions[i*3] = rawData[i*14];
+        positions[i*3+1] = rawData[i*14+1];
+        positions[i*3+2] = rawData[i*14+2];
+    }
+    sortWorker.postMessage({
+        positions, data: rawData, camX: camPos[0], camY: camPos[1], camZ: camPos[2], stride: 14
+    }, [positions.buffer]);
+}
 
 async function loadData() {
     info.textContent = 'Fetching splat data...';
     const resp = await fetch('/data.bin');
     const buf = await resp.arrayBuffer();
-    const f32 = new Float32Array(buf);
-    numPoints = f32.length / 14;
+    rawData = new Float32Array(buf);
+    numPoints = rawData.length / 14;
+    sortedData = new Float32Array(rawData);
     info.textContent = `${numPoints.toLocaleString()} Gaussians`;
 
     const stride = 14 * 4;
 
-    const vao = gl.createVertexArray();
+    vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
-    const vbo = gl.createBuffer();
+    vbo = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-    gl.bufferData(gl.ARRAY_BUFFER, f32, gl.STATIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, sortedData, gl.DYNAMIC_DRAW);
 
     const bind = (name, size, offset) => {
         const loc = gl.getAttribLocation(prog, name);
@@ -182,6 +234,17 @@ async function loadData() {
     bind('a_opacity', 1, 6);
     bind('a_scale', 3, 7);
     bind('a_quat', 4, 10);
+
+    sortWorker = createSortWorker();
+    sortWorker.onmessage = function(e) {
+        sortedData = e.data.sorted;
+        gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+        gl.bufferData(gl.ARRAY_BUFFER, sortedData, gl.DYNAMIC_DRAW);
+        lastSortCamPos = [...camPos];
+        sorting = false;
+        info.textContent = `${numPoints.toLocaleString()} Gaussians (sorted)`;
+    };
+    requestSort();
 }
 
 // Camera (will be set from scene_info)
@@ -245,6 +308,8 @@ function render() {
         camTarget[1] + camDist * Math.sin(rotX),
         camTarget[2] + camDist * Math.cos(rotX) * Math.cos(rotY)
     ];
+
+    requestSort();
 
     const fov = Math.PI/3;
     const aspect = canvas.width / canvas.height;
