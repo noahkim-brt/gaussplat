@@ -11,5 +11,6 @@ pillow==11.3.0
 tqdm==4.67.1
 tensorboard==2.20.0
 ninja==1.13.0
-lpips
-matplotlib
+lpips==0.1.4
+matplotlib==3.10.7
+scipy==1.15.3
