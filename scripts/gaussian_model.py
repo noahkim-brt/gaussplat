@@ -78,6 +78,43 @@ def init_gaussians(
     return params
 
 
+def save_checkpoint(
+    params: dict[str, nn.Parameter],
+    optimizers: dict[str, torch.optim.Optimizer],
+    step: int,
+    path: str,
+) -> None:
+    """Save training checkpoint (params + optimizer state + step)."""
+    ckpt = {
+        "step": step,
+        "params": {k: v.data for k, v in params.items()},
+        "optimizers": {k: v.state_dict() for k, v in optimizers.items()},
+    }
+    torch.save(ckpt, path)
+    print(f"Checkpoint saved: step {step} → {path}")
+
+
+def load_checkpoint(
+    path: str,
+    device: str = "cuda",
+) -> tuple[dict[str, nn.Parameter], dict, int]:
+    """Load training checkpoint.
+
+    Returns:
+        params: Dict of nn.Parameters on device.
+        optimizer_states: Dict of optimizer state_dicts.
+        step: Training step to resume from.
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=True)
+    params = {}
+    for k, v in ckpt["params"].items():
+        params[k] = nn.Parameter(v.to(device))
+
+    n = params["means"].shape[0]
+    print(f"Loaded checkpoint: step {ckpt['step']}, {n} Gaussians from {path}")
+    return params, ckpt["optimizers"], ckpt["step"]
+
+
 def save_ply(params: dict[str, nn.Parameter], path: str) -> None:
     """Save Gaussian parameters to a PLY file.
 

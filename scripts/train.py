@@ -18,7 +18,7 @@ from data_loader import (
     load_colmap_scene,
     split_train_test,
 )
-from gaussian_model import init_gaussians, save_ply
+from gaussian_model import init_gaussians, load_checkpoint, save_checkpoint, save_ply
 
 # ─── SSIM ────────────────────────────────────────────────────────────────────
 
@@ -161,6 +161,7 @@ def train(
     log_interval: int = 100,
     test_interval: int = 5_000,
     test_every_n: int = 8,
+    resume_from: str = "",
 ) -> None:
     """Train a 3D Gaussian Splatting model.
 
@@ -183,6 +184,7 @@ def train(
         log_interval: Logging interval.
         test_interval: Run evaluation every N iterations (0 = disabled).
         test_every_n: Hold out every N-th view for testing.
+        resume_from: Path to checkpoint .pt file to resume training from.
     """
     if save_iterations is None:
         save_iterations = [7_000, 30_000]
@@ -224,7 +226,12 @@ def train(
         lpips_fn = None
 
     # ── Initialize Gaussians ──────────────────────────────────────────────
-    params = init_gaussians(points_xyz, points_rgb, device)
+    start_step = 0
+    if resume_from:
+        params, optimizer_states, start_step = load_checkpoint(resume_from, device)
+    else:
+        params = init_gaussians(points_xyz, points_rgb, device)
+        optimizer_states = None
 
     # ── Optimizers (one per parameter, required by gsplat strategy) ───────
     optimizers = {
@@ -238,6 +245,11 @@ def train(
         "sh_rest": torch.optim.Adam([params["sh_rest"]], lr=lr_sh_rest, eps=1e-15),
     }
 
+    if optimizer_states:
+        for k, opt in optimizers.items():
+            if k in optimizer_states:
+                opt.load_state_dict(optimizer_states[k])
+
     # ── Densification strategy ────────────────────────────────────────────
     strategy = DefaultStrategy(verbose=True)
     strategy.check_sanity(params, optimizers)
@@ -247,12 +259,13 @@ def train(
     writer = SummaryWriter(log_dir=str(output_path / "tb"))
 
     # ── Training loop ─────────────────────────────────────────────────────
-    print(f"\nStarting training for {iterations} iterations...")
+    remaining = iterations - start_step
+    print(f"\nStarting training for {iterations} iterations (resuming from {start_step})...")
     print(f"  Views: {num_views}")
-    print(f"  Initial Gaussians: {params['means'].shape[0]}")
+    print(f"  Gaussians: {params['means'].shape[0]}")
     print(f"  Loss: (1-{lambda_dssim})*L1 + {lambda_dssim}*SSIM")
 
-    pbar = tqdm(range(1, iterations + 1), desc="Training")
+    pbar = tqdm(range(start_step + 1, iterations + 1), desc="Training", initial=start_step, total=iterations)
     running_loss = 0.0
     t0 = time.time()
 
@@ -339,8 +352,8 @@ def train(
         if step in save_iterations:
             ckpt_dir = output_path / "point_cloud" / f"iteration_{step}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            ply_path = str(ckpt_dir / "point_cloud.ply")
-            save_ply(params, ply_path)
+            save_ply(params, str(ckpt_dir / "point_cloud.ply"))
+            save_checkpoint(params, optimizers, step, str(ckpt_dir / "checkpoint.pt"))
 
         # Test evaluation
         if test_cameras and test_interval > 0 and step % test_interval == 0:
@@ -362,6 +375,7 @@ def train(
     final_dir = output_path / "point_cloud" / f"iteration_{iterations}"
     final_dir.mkdir(parents=True, exist_ok=True)
     save_ply(params, str(final_dir / "point_cloud.ply"))
+    save_checkpoint(params, optimizers, iterations, str(final_dir / "checkpoint.pt"))
 
     # ── Final evaluation ──────────────────────────────────────────────────
     if test_cameras:
@@ -407,6 +421,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--test-every-n", type=int, default=8, help="Hold out every N-th view for testing"
     )
+    parser.add_argument(
+        "--resume", default="", help="Path to checkpoint.pt to resume training from"
+    )
     args = parser.parse_args()
 
     train(
@@ -419,4 +436,5 @@ if __name__ == "__main__":
         lambda_dssim=args.lambda_dssim,
         test_interval=args.test_interval,
         test_every_n=args.test_every_n,
+        resume_from=args.resume,
     )
