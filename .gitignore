@@ -3,7 +3,11 @@ data/*.mp4
 data/*/images/
 data/*/sparse/
 data/*/database.db
+data/*/mast3r*/
 output/
+
+# Third-party repos
+third_party/
 
 # Python
 __pycache__/

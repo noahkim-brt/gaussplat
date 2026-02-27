@@ -16,6 +16,7 @@ from data_loader import (
     cameras_to_tensors,
     compute_scene_scale,
     load_colmap_scene,
+    load_mast3r_scene,
     split_train_test,
 )
 from gaussian_model import init_gaussians, load_checkpoint, save_checkpoint, save_ply
@@ -162,6 +163,7 @@ def train(
     test_interval: int = 5_000,
     test_every_n: int = 8,
     resume_from: str = "",
+    sfm_method: str = "colmap",
 ) -> None:
     """Train a 3D Gaussian Splatting model.
 
@@ -185,6 +187,7 @@ def train(
         test_interval: Run evaluation every N iterations (0 = disabled).
         test_every_n: Hold out every N-th view for testing.
         resume_from: Path to checkpoint .pt file to resume training from.
+        sfm_method: SfM method used ('colmap' or 'mast3r').
     """
     if save_iterations is None:
         save_iterations = [7_000, 30_000]
@@ -194,10 +197,15 @@ def train(
     output_path.mkdir(parents=True, exist_ok=True)
 
     # ── Load data ─────────────────────────────────────────────────────────
-    print("Loading scene data...")
-    all_cameras, points_xyz, points_rgb = load_colmap_scene(
-        scene_dir, model_idx=model_idx, resolution_scale=resolution_scale
-    )
+    print(f"Loading scene data (sfm={sfm_method})...")
+    if sfm_method == "mast3r":
+        all_cameras, points_xyz, points_rgb = load_mast3r_scene(
+            scene_dir, resolution_scale=resolution_scale
+        )
+    else:
+        all_cameras, points_xyz, points_rgb = load_colmap_scene(
+            scene_dir, model_idx=model_idx, resolution_scale=resolution_scale
+        )
     scene_scale = compute_scene_scale(points_xyz)
 
     if test_interval > 0 and len(all_cameras) > 4:
@@ -424,6 +432,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--resume", default="", help="Path to checkpoint.pt to resume training from"
     )
+    parser.add_argument(
+        "--sfm-method", choices=["colmap", "mast3r"], default="colmap",
+        help="SfM method used for reconstruction",
+    )
     args = parser.parse_args()
 
     train(
@@ -437,4 +449,5 @@ if __name__ == "__main__":
         test_interval=args.test_interval,
         test_every_n=args.test_every_n,
         resume_from=args.resume,
+        sfm_method=args.sfm_method,
     )

@@ -169,6 +169,84 @@ def split_train_test(
     return train, test
 
 
+def load_mast3r_scene(
+    scene_dir: str,
+    image_dir: str = "images",
+    resolution_scale: int = 1,
+) -> tuple[list[CameraInfo], np.ndarray, np.ndarray]:
+    """Load a MASt3R reconstruction and associated images.
+
+    MASt3R saves camera intrinsics at its inference resolution (e.g. 512px).
+    We load the original full-resolution images and rescale K accordingly.
+
+    Args:
+        scene_dir: Root scene directory containing mast3r/ and images/.
+        image_dir: Subdirectory name for images.
+        resolution_scale: Downscale factor for images (1 = original).
+
+    Returns:
+        cameras: List of CameraInfo for each reconstructed view.
+        points_xyz: (N, 3) initial 3D point positions.
+        points_rgb: (N, 3) initial point colors in [0, 1].
+    """
+    scene_path = Path(scene_dir)
+    recon_path = scene_path / "mast3r" / "reconstruction.npz"
+    images_path = scene_path / image_dir
+
+    data = np.load(str(recon_path), allow_pickle=True)
+    Ks = data["intrinsics"]
+    w2cs = data["world_to_cam"]
+    image_names = data["image_names"]
+    mast3r_widths = data["widths"]
+    mast3r_heights = data["heights"]
+    points_xyz = data["points_xyz"]
+    points_rgb = data["points_rgb"]
+
+    print(f"Loaded {len(points_xyz)} sparse 3D points (MASt3R)")
+
+    cameras = []
+    for i, name in enumerate(image_names):
+        img_path = images_path / name
+        img = cv2.imread(str(img_path))
+        if img is None:
+            print(f"  Warning: could not load {img_path}, skipping")
+            continue
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = img.shape[:2]
+
+        K = Ks[i].copy()
+        sx = orig_w / mast3r_widths[i]
+        sy = orig_h / mast3r_heights[i]
+        K[0, :] *= sx
+        K[1, :] *= sy
+
+        if resolution_scale > 1:
+            new_w = orig_w // resolution_scale
+            new_h = orig_h // resolution_scale
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            K[0, :] /= resolution_scale
+            K[1, :] /= resolution_scale
+            width, height = new_w, new_h
+        else:
+            width, height = orig_w, orig_h
+
+        img = img.astype(np.float32) / 255.0
+
+        cameras.append(
+            CameraInfo(
+                image_name=str(name),
+                width=width,
+                height=height,
+                K=K,
+                world_to_cam=w2cs[i],
+                image=img,
+            )
+        )
+
+    print(f"Loaded {len(cameras)} camera views (MASt3R)")
+    return cameras, points_xyz, points_rgb
+
+
 def compute_scene_scale(points_xyz: np.ndarray) -> float:
     """Compute scene scale as the average distance from centroid.
 
