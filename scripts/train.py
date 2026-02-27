@@ -12,7 +12,12 @@ from gsplat import DefaultStrategy, rasterization
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from data_loader import cameras_to_tensors, compute_scene_scale, load_colmap_scene
+from data_loader import (
+    cameras_to_tensors,
+    compute_scene_scale,
+    load_colmap_scene,
+    split_train_test,
+)
 from gaussian_model import init_gaussians, save_ply
 
 # ─── SSIM ────────────────────────────────────────────────────────────────────
@@ -59,6 +64,66 @@ def _ssim(
     return ssim_map.mean()
 
 
+# ─── Metrics ─────────────────────────────────────────────────────────────────
+
+
+def psnr(img1: torch.Tensor, img2: torch.Tensor) -> float:
+    mse = F.mse_loss(img1, img2).item()
+    if mse == 0:
+        return float("inf")
+    return 10.0 * math.log10(1.0 / mse)
+
+
+@torch.no_grad()
+def evaluate(
+    params: dict,
+    viewmats: torch.Tensor,
+    Ks: torch.Tensor,
+    gt_images: list[torch.Tensor],
+    widths: list[int],
+    heights: list[int],
+    sh_degree: int = 3,
+    lpips_fn=None,
+) -> dict[str, float]:
+    """Evaluate on a set of views. Returns dict of averaged metrics."""
+    psnr_vals, ssim_vals, lpips_vals = [], [], []
+    colors = torch.cat([params["sh0"], params["sh_rest"]], dim=1)
+
+    for i in range(len(gt_images)):
+        rendered, _, _ = rasterization(
+            means=params["means"],
+            quats=params["quats"],
+            scales=torch.exp(params["scales"]),
+            opacities=torch.sigmoid(params["opacities"]),
+            colors=colors,
+            viewmats=viewmats[i : i + 1],
+            Ks=Ks[i : i + 1],
+            width=widths[i],
+            height=heights[i],
+            sh_degree=sh_degree,
+            packed=True,
+            render_mode="RGB",
+        )
+        rendered_image = rendered[0]
+        gt = gt_images[i]
+
+        psnr_vals.append(psnr(rendered_image, gt))
+        ssim_vals.append(_ssim(rendered_image, gt).item())
+
+        if lpips_fn is not None:
+            r = rendered_image.permute(2, 0, 1).unsqueeze(0) * 2 - 1
+            g = gt.permute(2, 0, 1).unsqueeze(0) * 2 - 1
+            lpips_vals.append(lpips_fn(r, g).item())
+
+    metrics = {
+        "psnr": sum(psnr_vals) / len(psnr_vals),
+        "ssim": sum(ssim_vals) / len(ssim_vals),
+    }
+    if lpips_vals:
+        metrics["lpips"] = sum(lpips_vals) / len(lpips_vals)
+    return metrics
+
+
 # ─── Learning rate schedule ──────────────────────────────────────────────────
 
 
@@ -94,6 +159,8 @@ def train(
     lambda_dssim: float = 0.2,
     save_iterations: list[int] | None = None,
     log_interval: int = 100,
+    test_interval: int = 5_000,
+    test_every_n: int = 8,
 ) -> None:
     """Train a 3D Gaussian Splatting model.
 
@@ -114,6 +181,8 @@ def train(
         lambda_dssim: Weight for SSIM loss component.
         save_iterations: Iterations at which to save checkpoints.
         log_interval: Logging interval.
+        test_interval: Run evaluation every N iterations (0 = disabled).
+        test_every_n: Hold out every N-th view for testing.
     """
     if save_iterations is None:
         save_iterations = [7_000, 30_000]
@@ -124,14 +193,35 @@ def train(
 
     # ── Load data ─────────────────────────────────────────────────────────
     print("Loading scene data...")
-    cameras, points_xyz, points_rgb = load_colmap_scene(
+    all_cameras, points_xyz, points_rgb = load_colmap_scene(
         scene_dir, model_idx=model_idx, resolution_scale=resolution_scale
     )
-    viewmats, Ks, gt_images, widths, heights = cameras_to_tensors(cameras, device)
     scene_scale = compute_scene_scale(points_xyz)
-    num_views = len(cameras)
+
+    if test_interval > 0 and len(all_cameras) > 4:
+        train_cameras, test_cameras = split_train_test(all_cameras, every_n=test_every_n)
+    else:
+        train_cameras, test_cameras = all_cameras, []
+
+    viewmats, Ks, gt_images, widths, heights = cameras_to_tensors(train_cameras, device)
+    num_views = len(train_cameras)
     print(f"Scene scale: {scene_scale:.4f}")
     print(f"Image resolution: {widths[0]}x{heights[0]}")
+
+    if test_cameras:
+        test_viewmats, test_Ks, test_gt_images, test_widths, test_heights = (
+            cameras_to_tensors(test_cameras, device)
+        )
+        try:
+            import lpips as lpips_lib
+            lpips_fn = lpips_lib.LPIPS(net="vgg").to(device)
+            print("LPIPS loaded (vgg)")
+        except ImportError:
+            lpips_fn = None
+            print("LPIPS not available, skipping")
+    else:
+        test_viewmats = test_Ks = test_gt_images = test_widths = test_heights = None
+        lpips_fn = None
 
     # ── Initialize Gaussians ──────────────────────────────────────────────
     params = init_gaussians(points_xyz, points_rgb, device)
@@ -252,11 +342,40 @@ def train(
             ply_path = str(ckpt_dir / "point_cloud.ply")
             save_ply(params, ply_path)
 
+        # Test evaluation
+        if test_cameras and test_interval > 0 and step % test_interval == 0:
+            metrics = evaluate(
+                params, test_viewmats, test_Ks, test_gt_images,
+                test_widths, test_heights, sh_degree, lpips_fn,
+            )
+            msg = f"[Test @ {step}] PSNR={metrics['psnr']:.2f} SSIM={metrics['ssim']:.4f}"
+            if "lpips" in metrics:
+                msg += f" LPIPS={metrics['lpips']:.4f}"
+            tqdm.write(msg)
+            writer.add_scalar("test/psnr", metrics["psnr"], step)
+            writer.add_scalar("test/ssim", metrics["ssim"], step)
+            if "lpips" in metrics:
+                writer.add_scalar("test/lpips", metrics["lpips"], step)
+
     # ── Final save ────────────────────────────────────────────────────────
     total_time = time.time() - t0
     final_dir = output_path / "point_cloud" / f"iteration_{iterations}"
     final_dir.mkdir(parents=True, exist_ok=True)
     save_ply(params, str(final_dir / "point_cloud.ply"))
+
+    # ── Final evaluation ──────────────────────────────────────────────────
+    if test_cameras:
+        print("\nFinal evaluation on test views...")
+        final_metrics = evaluate(
+            params, test_viewmats, test_Ks, test_gt_images,
+            test_widths, test_heights, sh_degree, lpips_fn,
+        )
+        print(f"  PSNR:  {final_metrics['psnr']:.2f} dB")
+        print(f"  SSIM:  {final_metrics['ssim']:.4f}")
+        if "lpips" in final_metrics:
+            print(f"  LPIPS: {final_metrics['lpips']:.4f}")
+        for k, v in final_metrics.items():
+            writer.add_scalar(f"final/{k}", v, iterations)
 
     writer.close()
 
@@ -282,6 +401,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lambda-dssim", type=float, default=0.2, help="SSIM loss weight"
     )
+    parser.add_argument(
+        "--test-interval", type=int, default=5000, help="Test eval interval (0=disable)"
+    )
+    parser.add_argument(
+        "--test-every-n", type=int, default=8, help="Hold out every N-th view for testing"
+    )
     args = parser.parse_args()
 
     train(
@@ -292,4 +417,6 @@ if __name__ == "__main__":
         resolution_scale=args.resolution_scale,
         sh_degree=args.sh_degree,
         lambda_dssim=args.lambda_dssim,
+        test_interval=args.test_interval,
+        test_every_n=args.test_every_n,
     )

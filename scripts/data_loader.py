@@ -139,6 +139,36 @@ def cameras_to_tensors(
     return viewmats, Ks, images, widths, heights
 
 
+def split_train_test(
+    cameras: list[CameraInfo],
+    test_ratio: float = 0.125,
+    every_n: int | None = None,
+) -> tuple[list[CameraInfo], list[CameraInfo]]:
+    """Split cameras into train and test sets.
+
+    Args:
+        cameras: All camera views, sorted by name.
+        test_ratio: Fraction of views to hold out for testing.
+        every_n: If set, pick every N-th view as test (overrides test_ratio).
+
+    Returns:
+        (train_cameras, test_cameras)
+    """
+    sorted_cams = sorted(cameras, key=lambda c: c.image_name)
+    if every_n is None:
+        every_n = max(1, round(1.0 / test_ratio))
+
+    train, test = [], []
+    for i, cam in enumerate(sorted_cams):
+        if i % every_n == 0:
+            test.append(cam)
+        else:
+            train.append(cam)
+
+    print(f"Split: {len(train)} train, {len(test)} test (every {every_n}th frame)")
+    return train, test
+
+
 def compute_scene_scale(points_xyz: np.ndarray) -> float:
     """Compute scene scale as the average distance from centroid.
 
