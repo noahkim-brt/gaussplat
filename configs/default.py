@@ -53,5 +53,8 @@ class SfMConfig:
     scene_dir: str = ""
     image_dir: str = "images"
     camera_model: str = "OPENCV"
-    use_sequential_matcher: bool = True  # True for video input, False for unordered photos
+    matcher: str = "sequential"  # 'sequential', 'exhaustive', or 'vocab_tree'
     max_image_size: int = 3200
+    max_num_features: int = 16384
+    single_camera: bool = True  # True for single video, False for multi-camera
+    overlap: int = 20  # sequential matcher overlap (frames)
