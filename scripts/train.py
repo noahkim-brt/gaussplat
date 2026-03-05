@@ -1,4 +1,10 @@
-"""Train 3D Gaussian Splatting model using gsplat."""
+"""Train 3D Gaussian Splatting model using gsplat.
+
+Supports depth-regularized training following DNGaussian (Li et al., CVPR 2024):
+  - Hard depth loss: L1 between rendered depth and mono depth (with per-image scale-shift)
+  - Soft depth loss: Pearson correlation (scale-shift invariant)
+  - Dense initialization from unprojected depth maps (FSGS-style)
+"""
 
 import argparse
 import math
@@ -19,7 +25,13 @@ from data_loader import (
     load_mast3r_scene,
     split_train_test,
 )
+from load_calibrated_rig import load_calibrated_rig, generate_initial_points
 from gaussian_model import init_gaussians, load_checkpoint, save_checkpoint, save_ply
+from estimate_depth import (
+    create_dense_init_from_depth,
+    load_depth_maps_for_training,
+    predict_depth_anything_v2,
+)
 
 # ─── SSIM ────────────────────────────────────────────────────────────────────
 
@@ -63,6 +75,63 @@ def _ssim(
     )
 
     return ssim_map.mean()
+
+
+# ─── Depth losses ────────────────────────────────────────────────────────────
+
+
+def depth_loss_hard(
+    rendered_depth: torch.Tensor,
+    mono_depth: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """Hard depth loss: L1 between rendered depth and scale-shift aligned mono depth.
+
+    Following DNGaussian: d_aligned = scale * d_mono + shift
+    """
+    aligned = scale * mono_depth + shift
+    valid = (aligned > 0.01) & (rendered_depth > 0.01)
+    if valid.sum() < 10:
+        return torch.tensor(0.0, device=rendered_depth.device)
+    return F.l1_loss(rendered_depth[valid], aligned[valid])
+
+
+def depth_loss_pearson(
+    rendered_depth: torch.Tensor,
+    mono_depth: torch.Tensor,
+) -> torch.Tensor:
+    """Soft depth loss: 1 - Pearson correlation (scale-shift invariant)."""
+    valid = (mono_depth > 0.01) & (rendered_depth > 0.01)
+    if valid.sum() < 10:
+        return torch.tensor(0.0, device=rendered_depth.device)
+    r = rendered_depth[valid]
+    m = mono_depth[valid]
+    r_centered = r - r.mean()
+    m_centered = m - m.mean()
+    corr = (r_centered * m_centered).sum() / (
+        torch.sqrt((r_centered**2).sum() * (m_centered**2).sum()) + 1e-8
+    )
+    return 1.0 - corr
+
+
+def compute_optimal_scale_shift(
+    rendered_depth: torch.Tensor,
+    mono_depth: torch.Tensor,
+) -> tuple[float, float]:
+    """Analytically compute optimal scale/shift (MonoSDF approach)."""
+    valid = (mono_depth > 0.01) & (rendered_depth > 0.01)
+    if valid.sum() < 10:
+        return 1.0, 0.0
+    r = rendered_depth[valid].detach()
+    m = mono_depth[valid]
+    m_mean, r_mean = m.mean(), r.mean()
+    m_centered = m - m_mean
+    cov = (m_centered * (r - r_mean)).sum()
+    var = (m_centered**2).sum() + 1e-8
+    scale = cov / var
+    shift = r_mean - scale * m_mean
+    return scale.item(), shift.item()
 
 
 # ─── Metrics ─────────────────────────────────────────────────────────────────
@@ -164,6 +233,15 @@ def train(
     test_every_n: int = 8,
     resume_from: str = "",
     sfm_method: str = "colmap",
+    use_depth: bool = False,
+    depth_model_size: str = "Large",
+    lambda_depth_hard: float = 0.5,
+    lambda_depth_pearson: float = 0.1,
+    depth_loss_from: int = 0,
+    depth_loss_until: int = 15_000,
+    depth_init: bool = False,
+    depth_init_voxel: float = 0.05,
+    depth_init_stride: int = 8,
 ) -> None:
     """Train a 3D Gaussian Splatting model.
 
@@ -188,6 +266,15 @@ def train(
         test_every_n: Hold out every N-th view for testing.
         resume_from: Path to checkpoint .pt file to resume training from.
         sfm_method: SfM method used ('colmap' or 'mast3r').
+        use_depth: Enable depth-regularized training.
+        depth_model_size: Depth Anything v2 model size.
+        lambda_depth_hard: Weight for hard depth loss (L1).
+        lambda_depth_pearson: Weight for soft depth loss (Pearson).
+        depth_loss_from: Start depth loss at this iteration.
+        depth_loss_until: Stop depth loss at this iteration (0 = never stop).
+        depth_init: Use dense depth-unprojected point cloud for initialization.
+        depth_init_voxel: Voxel size for depth init downsampling.
+        depth_init_stride: Pixel stride for depth unprojection.
     """
     if save_iterations is None:
         save_iterations = [7_000, 30_000]
@@ -198,7 +285,15 @@ def train(
 
     # ── Load data ─────────────────────────────────────────────────────────
     print(f"Loading scene data (sfm={sfm_method})...")
-    if sfm_method == "mast3r":
+    if sfm_method == "calibrated_rig":
+        all_cameras, points_xyz, points_rgb = load_calibrated_rig(
+            scene_dir, resolution_scale=resolution_scale
+        )
+        if len(points_xyz) == 0:
+            print("No SfM points — generating initial points from camera rays...")
+            points_xyz, points_rgb = generate_initial_points(all_cameras, None, None, 0, 0, 0)
+            print(f"  Generated {len(points_xyz)} initial points")
+    elif sfm_method == "mast3r":
         all_cameras, points_xyz, points_rgb = load_mast3r_scene(
             scene_dir, resolution_scale=resolution_scale
         )
@@ -207,6 +302,40 @@ def train(
             scene_dir, model_idx=model_idx, resolution_scale=resolution_scale
         )
     scene_scale = compute_scene_scale(points_xyz)
+
+    # ── Depth estimation ──────────────────────────────────────────────────
+    depth_dir = Path(scene_dir) / "depth"
+    depth_maps_train = None
+    if use_depth:
+        images_dir = Path(scene_dir) / "images"
+        existing = list(depth_dir.glob("*_depth.npy"))
+        if len(existing) < len(all_cameras):
+            print("Running Depth Anything v2 estimation...")
+            image_paths = sorted(
+                [images_dir / cam.image_name for cam in all_cameras]
+            )
+            predict_depth_anything_v2(
+                image_paths, depth_dir,
+                model_size=depth_model_size,
+                batch_size=4,
+            )
+            torch.cuda.empty_cache()
+        else:
+            print(f"Found {len(existing)} existing depth maps in {depth_dir}")
+
+        if depth_init and not resume_from:
+            print("Creating dense initialization from depth maps...")
+            dense_xyz, dense_rgb = create_dense_init_from_depth(
+                all_cameras, depth_dir,
+                voxel_size=depth_init_voxel,
+                stride=depth_init_stride,
+            )
+            if len(dense_xyz) > 0:
+                import numpy as np
+                points_xyz = np.concatenate([points_xyz, dense_xyz], axis=0)
+                points_rgb = np.concatenate([points_rgb, dense_rgb], axis=0)
+                print(f"Combined init: {len(points_xyz)} points (SfM + depth)")
+                scene_scale = compute_scene_scale(points_xyz)
 
     if test_interval > 0 and len(all_cameras) > 4:
         train_cameras, test_cameras = split_train_test(all_cameras, every_n=test_every_n)
@@ -217,6 +346,11 @@ def train(
     num_views = len(train_cameras)
     print(f"Scene scale: {scene_scale:.4f}")
     print(f"Image resolution: {widths[0]}x{heights[0]}")
+
+    if use_depth:
+        depth_maps_train = load_depth_maps_for_training(train_cameras, depth_dir, device)
+        depth_scales = [None] * num_views
+        depth_shifts = [None] * num_views
 
     if test_cameras:
         test_viewmats, test_Ks, test_gt_images, test_widths, test_heights = (
@@ -268,10 +402,15 @@ def train(
 
     # ── Training loop ─────────────────────────────────────────────────────
     remaining = iterations - start_step
+    depth_active = use_depth and depth_maps_train is not None
+    render_mode = "RGB+ED" if depth_active else "RGB"
+
     print(f"\nStarting training for {iterations} iterations (resuming from {start_step})...")
     print(f"  Views: {num_views}")
     print(f"  Gaussians: {params['means'].shape[0]}")
     print(f"  Loss: (1-{lambda_dssim})*L1 + {lambda_dssim}*SSIM")
+    if depth_active:
+        print(f"  Depth: hard={lambda_depth_hard} pearson={lambda_depth_pearson} (iters {depth_loss_from}-{depth_loss_until})")
 
     pbar = tqdm(range(start_step + 1, iterations + 1), desc="Training", initial=start_step, total=iterations)
     running_loss = 0.0
@@ -314,15 +453,47 @@ def train(
             sh_degree=sh_degree_current,
             packed=True,
             absgrad=False,
-            render_mode="RGB",
+            render_mode=render_mode,
         )
 
-        rendered_image = rendered[0]  # (H, W, 3)
+        if depth_active:
+            rendered_image = rendered[0, :, :, :3]  # (H, W, 3)
+            rendered_depth = rendered[0, :, :, 3]   # (H, W) expected depth
+        else:
+            rendered_image = rendered[0]  # (H, W, 3)
+            rendered_depth = None
 
         # Loss: L1 + SSIM
         l1_loss = F.l1_loss(rendered_image, gt_image)
         ssim_loss = 1.0 - _ssim(rendered_image, gt_image)
         loss = (1.0 - lambda_dssim) * l1_loss + lambda_dssim * ssim_loss
+
+        # Depth losses
+        d_hard_loss = torch.tensor(0.0, device=device)
+        d_pearson_loss = torch.tensor(0.0, device=device)
+        if (
+            depth_active
+            and depth_maps_train[idx] is not None
+            and step >= depth_loss_from
+            and (depth_loss_until == 0 or step <= depth_loss_until)
+        ):
+            mono_depth = depth_maps_train[idx]
+
+            if depth_scales[idx] is None or step % 500 == 0:
+                s, sh = compute_optimal_scale_shift(rendered_depth.detach(), mono_depth)
+                depth_scales[idx] = s
+                depth_shifts[idx] = sh
+
+            scale_t = torch.tensor(depth_scales[idx], device=device)
+            shift_t = torch.tensor(depth_shifts[idx], device=device)
+
+            if lambda_depth_hard > 0:
+                d_hard_loss = depth_loss_hard(rendered_depth, mono_depth, scale_t, shift_t)
+                loss = loss + lambda_depth_hard * d_hard_loss
+
+            if lambda_depth_pearson > 0:
+                d_pearson_loss = depth_loss_pearson(rendered_depth, mono_depth)
+                loss = loss + lambda_depth_pearson * d_pearson_loss
 
         # Densification callbacks
         strategy.step_pre_backward(params, optimizers, strategy_state, step, info)
@@ -354,6 +525,9 @@ def train(
             writer.add_scalar("train/ssim_loss", ssim_loss.item(), step)
             writer.add_scalar("train/num_gaussians", n_gaussians, step)
             writer.add_scalar("train/lr_means", lr_means_current, step)
+            if depth_active:
+                writer.add_scalar("train/depth_hard_loss", d_hard_loss.item(), step)
+                writer.add_scalar("train/depth_pearson_loss", d_pearson_loss.item(), step)
             running_loss = 0.0
 
         # Save checkpoints
@@ -433,9 +607,23 @@ if __name__ == "__main__":
         "--resume", default="", help="Path to checkpoint.pt to resume training from"
     )
     parser.add_argument(
-        "--sfm-method", choices=["colmap", "mast3r"], default="colmap",
+        "--sfm-method", choices=["colmap", "mast3r", "calibrated_rig"], default="colmap",
         help="SfM method used for reconstruction",
     )
+    parser.add_argument("--use-depth", action="store_true", help="Enable depth-regularized training")
+    parser.add_argument("--depth-model-size", default="Large", choices=["Small", "Base", "Large"],
+                        help="Depth Anything v2 model size")
+    parser.add_argument("--lambda-depth-hard", type=float, default=0.5, help="Hard depth loss weight")
+    parser.add_argument("--lambda-depth-pearson", type=float, default=0.1, help="Pearson depth loss weight")
+    parser.add_argument("--depth-loss-from", type=int, default=0, help="Start depth loss at iteration")
+    parser.add_argument("--depth-loss-until", type=int, default=15000,
+                        help="Stop depth loss at iteration (0=never)")
+    parser.add_argument("--depth-init", action="store_true",
+                        help="Initialize with dense depth-unprojected point cloud")
+    parser.add_argument("--depth-init-voxel", type=float, default=0.05,
+                        help="Voxel size for depth init downsampling")
+    parser.add_argument("--depth-init-stride", type=int, default=8,
+                        help="Pixel stride for depth unprojection")
     args = parser.parse_args()
 
     train(
@@ -450,4 +638,13 @@ if __name__ == "__main__":
         test_every_n=args.test_every_n,
         resume_from=args.resume,
         sfm_method=args.sfm_method,
+        use_depth=args.use_depth,
+        depth_model_size=args.depth_model_size,
+        lambda_depth_hard=args.lambda_depth_hard,
+        lambda_depth_pearson=args.lambda_depth_pearson,
+        depth_loss_from=args.depth_loss_from,
+        depth_loss_until=args.depth_loss_until,
+        depth_init=args.depth_init,
+        depth_init_voxel=args.depth_init_voxel,
+        depth_init_stride=args.depth_init_stride,
     )

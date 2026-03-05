@@ -256,6 +256,8 @@ def compute_scene_scale(points_xyz: np.ndarray) -> float:
     Returns:
         Scene scale (average distance from centroid).
     """
+    if len(points_xyz) == 0:
+        return 1.0
     centroid = points_xyz.mean(axis=0)
     distances = np.linalg.norm(points_xyz - centroid, axis=1)
     return float(np.mean(distances))

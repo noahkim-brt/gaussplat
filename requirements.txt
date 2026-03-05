@@ -14,3 +14,4 @@ ninja==1.13.0
 lpips==0.1.4
 matplotlib==3.10.7
 scipy==1.15.3
+transformers>=4.45.0

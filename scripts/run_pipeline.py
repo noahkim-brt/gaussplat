@@ -33,6 +33,11 @@ def run_pipeline(
     mast3r_image_size: int = 512,
     mast3r_scene_graph: str = "swin-4",
     mast3r_max_images: int = 0,
+    use_depth: bool = False,
+    depth_model_size: str = "Large",
+    lambda_depth_hard: float = 0.5,
+    lambda_depth_pearson: float = 0.1,
+    depth_init: bool = False,
 ) -> None:
     """Run the full Gaussian splatting pipeline from video to trained model.
 
@@ -54,6 +59,11 @@ def run_pipeline(
         mast3r_image_size: Image size for MASt3R inference.
         mast3r_scene_graph: MASt3R pair generation strategy.
         mast3r_max_images: Max images for MASt3R (0 = all).
+        use_depth: Enable depth-regularized training.
+        depth_model_size: Depth Anything v2 model size.
+        lambda_depth_hard: Hard depth loss weight.
+        lambda_depth_pearson: Pearson depth loss weight.
+        depth_init: Initialize with dense depth-unprojected points.
     """
     input_path = Path(video_path)
     if not input_path.exists():
@@ -91,7 +101,9 @@ def run_pipeline(
     print(f"\n{'─'*60}")
     print(f"STEP 2: Structure-from-Motion ({sfm_method})")
     print(f"{'─'*60}")
-    if sfm_method == "mast3r":
+    if sfm_method == "calibrated_rig":
+        print("Skipping SfM — using calibrated rig poses from system_config.json + starfire.json")
+    elif sfm_method == "mast3r":
         if not MAST3R_AVAILABLE:
             raise RuntimeError(
                 "MASt3R not available. Ensure third_party/mast3r is cloned "
@@ -134,6 +146,11 @@ def run_pipeline(
         sh_degree=sh_degree,
         test_interval=test_interval,
         sfm_method=sfm_method,
+        use_depth=use_depth,
+        depth_model_size=depth_model_size,
+        lambda_depth_hard=lambda_depth_hard,
+        lambda_depth_pearson=lambda_depth_pearson,
+        depth_init=depth_init,
     )
 
     # Summary
@@ -166,12 +183,18 @@ if __name__ == "__main__":
     parser.add_argument("--sh-degree", type=int, default=3, help="Max SH degree")
     parser.add_argument("--test-interval", type=int, default=5000, help="Test eval interval")
     parser.add_argument(
-        "--sfm-method", choices=["colmap", "mast3r"], default="colmap",
-        help="SfM method: 'colmap' (default) or 'mast3r' (no COLMAP needed, works with few views)",
+        "--sfm-method", choices=["colmap", "mast3r", "calibrated_rig"], default="colmap",
+        help="SfM method: 'colmap', 'mast3r', or 'calibrated_rig' (uses system_config.json + starfire.json)",
     )
     parser.add_argument("--mast3r-image-size", type=int, default=512, help="MASt3R inference image size")
     parser.add_argument("--mast3r-scene-graph", default="swin-4", help="MASt3R pair strategy")
     parser.add_argument("--mast3r-max-images", type=int, default=0, help="Max images for MASt3R (0=all)")
+    parser.add_argument("--use-depth", action="store_true", help="Enable depth-regularized training")
+    parser.add_argument("--depth-model-size", default="Large", choices=["Small", "Base", "Large"],
+                        help="Depth Anything v2 model size")
+    parser.add_argument("--lambda-depth-hard", type=float, default=0.5, help="Hard depth loss weight")
+    parser.add_argument("--lambda-depth-pearson", type=float, default=0.1, help="Pearson depth loss weight")
+    parser.add_argument("--depth-init", action="store_true", help="Dense depth-based initialization")
     args = parser.parse_args()
 
     run_pipeline(
@@ -192,4 +215,9 @@ if __name__ == "__main__":
         mast3r_image_size=args.mast3r_image_size,
         mast3r_scene_graph=args.mast3r_scene_graph,
         mast3r_max_images=args.mast3r_max_images,
+        use_depth=args.use_depth,
+        depth_model_size=args.depth_model_size,
+        lambda_depth_hard=args.lambda_depth_hard,
+        lambda_depth_pearson=args.lambda_depth_pearson,
+        depth_init=args.depth_init,
     )
